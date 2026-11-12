@@ -1,0 +1,3 @@
+C:/nsu/3/networks/paper.io/build/CMakeFiles/PaperIO.dir
+C:/nsu/3/networks/paper.io/build/CMakeFiles/edit_cache.dir
+C:/nsu/3/networks/paper.io/build/CMakeFiles/rebuild_cache.dir

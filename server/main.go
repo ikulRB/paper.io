@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"net"
 	"sync"
@@ -103,48 +102,14 @@ func main() {
 		}
 	}()
 
-	buf := make([]byte, 65535)
+	buf := make([]byte, 2048)
 	for {
 		n, from, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			continue
 		}
-		pkt := buf[:n]
-
-		// 1. Запрос на пробитие NAT: "PUNCH|<target_ip:port>"
-		if bytes.HasPrefix(pkt, []byte("PUNCH|")) {
-			targetStr := string(pkt[6:])
-			targetAddr, err := net.ResolveUDPAddr("udp4", targetStr)
-			if err == nil {
-				notify := []byte("PUNCH|" + from.String())
-				conn.WriteToUDP(notify, targetAddr)
-				fmt.Printf("punch %s -> %s\n", from, targetAddr)
-			}
-			continue
-		}
-
-		// 2. Ретрансляция пакета: "RELAY|<target_ip:port>|<payload>"
-		if bytes.HasPrefix(pkt, []byte("RELAY|")) {
-			rest := pkt[6:]
-			sep := bytes.IndexByte(rest, '|')
-			if sep > 0 {
-				targetStr := string(rest[:sep])
-				payload := rest[sep+1:]
-				targetAddr, err := net.ResolveUDPAddr("udp4", targetStr)
-				if err == nil {
-					prefix := []byte("FROM|" + from.String() + "|")
-					out := make([]byte, len(prefix)+len(payload))
-					copy(out, prefix)
-					copy(out[len(prefix):], payload)
-					conn.WriteToUDP(out, targetAddr)
-				}
-			}
-			continue
-		}
-
-		// 3. Обычные сообщения каталога (Announcement / Discover)
 		var msg pb.GameMessage
-		if err := proto.Unmarshal(pkt, &msg); err != nil {
+		if err := proto.Unmarshal(buf[:n], &msg); err != nil {
 			continue
 		}
 		if msg.ProtocolVersion != 2 {

@@ -48,8 +48,9 @@ class Game:
         self.font_leaderboard = pygame.font.SysFont("Arial", 16, bold=True)
         self.font_gameover = pygame.font.SysFont("Arial", 38, bold=True)
 
-        self.players = [Player(player_name, player_color, self.MAP_RADIUS)]
-        self.main_player = self.players[0]
+        first_player = Player(player_name, player_color, self.MAP_RADIUS)
+        self.players = [first_player]
+        self.main_player = first_player
 
         if not is_network:
             self._spawn_bots(num_bots, bot_colors)
@@ -104,7 +105,6 @@ class Game:
         return True
 
     def apply_steer(self, player_id, steer_dir):
-        """steer_dir: -1 (влево), 0 (прямо), 1 (вправо)"""
         if steer_dir < -0.5:
             self.network_steer_dirs[player_id] = -1
         elif steer_dir > 0.5:
@@ -112,8 +112,7 @@ class Game:
         else:
             self.network_steer_dirs[player_id] = 0
 
-    def update_network(self):
-        """Вызывается хостом каждый кадр (60 FPS) для плавного движения и коллизий"""
+    def update_network(self, skip_collisions=False):
         self.particles.update()
 
         for p in self.players:
@@ -127,15 +126,30 @@ class Game:
                 p.angle += self.delta_angle
             self._move_player(p)
 
-        self._resolve_collisions()
+        if not skip_collisions:
+            self._resolve_collisions()
 
         if self.main_player.is_dead:
             self.result = "lose"
         elif self._check_victory():
             self.result = "win"
 
+    def step_client_local(self, my_steer_dir):
+        self.particles.update()
+
+        if self.main_player and not self.main_player.is_dead:
+            self.main_player._is_turning_locally = (my_steer_dir != 0)
+            if my_steer_dir < 0:
+                self.main_player.angle -= self.delta_angle
+            elif my_steer_dir > 0:
+                self.main_player.angle += self.delta_angle
+
+        for p in self.players:
+            if not p.is_dead:
+                p.predict_step(is_local_player=(p is self.main_player))
+
     def sync_players(self, net_players, my_id=0):
-        net_ids = [np["player_id"] for np in net_players]
+        net_ids = [np.get("player_id") for np in net_players]
 
         for p in self.players:
             pid = getattr(p, "player_id", 0)
@@ -145,18 +159,29 @@ class Game:
         self.players = [p for p in self.players if getattr(p, "player_id", 0) in net_ids]
 
         for np in net_players:
-            pid = np["player_id"]
+            pid = np.get("player_id")
+            color_idx = np.get("color_idx")
+            if pid == my_id and my_id != 0:
+                color = self.final_player_color
+            elif color_idx is not None and 0 <= color_idx < len(AVAILABLE_COLORS):
+                color = AVAILABLE_COLORS[color_idx]
+            else:
+                color = AVAILABLE_COLORS[(pid - 1) % len(AVAILABLE_COLORS)]
+
             player = next((p for p in self.players if getattr(p, "player_id", 0) == pid), None)
             if not player:
-                if pid == my_id and my_id != 0:
-                    color = self.final_player_color
-                else:
-                    color = AVAILABLE_COLORS[(pid - 1) % len(AVAILABLE_COLORS)]
-                player = Player(np["name"], color, self.MAP_RADIUS)
+                player = Player(np.get("name", "Player"), color, self.MAP_RADIUS)
                 player.player_id = pid
+                hx, hy = np.get("head", (0.0, 0.0))
+                player.last_head = (hx, hy)
+                player.points = [(hx, hy)]
+                player.base_trail_points = [(hx, hy)]
+                player.angle = np.get("angle", 0.0)
                 self.players.append(player)
             else:
-                player.name = np["name"]
+                player.name = np.get("name", player.name)
+                if player.color != color:
+                    player.set_color(color)
 
             if my_id != 0 and pid == my_id:
                 self.main_player = player
@@ -167,12 +192,13 @@ class Game:
             if not was_dead and is_dead_now:
                 self._kill_player(player)
 
-            player.update_from_network(
-                np["head"][0],
-                np["head"][1],
-                np["angle"],
-                np["trail"],
-                np["territory"],
+            hx, hy = np.get("head", (0.0, 0.0))
+            player.apply_network_snapshot(
+                hx,
+                hy,
+                np.get("angle", 0.0),
+                in_base=np.get("in_base", True),
+                territory=np.get("territory") or None,
                 score=np.get("score", 0),
                 is_dead=is_dead_now,
             )
@@ -218,25 +244,27 @@ class Game:
         p.area_percentage = min(100.0, (p.base_polygon.area / self.TOTAL_MAP_AREA) * 100)
 
     def _clamp_to_map(self, p, head):
-        next_x = head[0] + math.cos(p.angle) * p.speed
-        next_y = head[1] + math.sin(p.angle) * p.speed
+        hx, hy = head
+        next_x = hx + math.cos(p.angle) * p.speed
+        next_y = hy + math.sin(p.angle) * p.speed
 
         if math.hypot(next_x, next_y) < self.MAP_RADIUS - BOUNDARY_MARGIN:
             return next_x, next_y
 
-        boundary_angle = math.atan2(head[1], head[0])
+        boundary_angle = math.atan2(hy, hx)
         angle_diff = (p.angle - boundary_angle + math.pi) % (math.pi * 2) - math.pi
         if math.cos(p.angle - boundary_angle) > 0:
             if angle_diff > 0:
                 p.angle = boundary_angle + math.pi / 2
             else:
                 p.angle = boundary_angle - math.pi / 2
-        return (head[0] + math.cos(p.angle) * p.speed,
-                head[1] + math.sin(p.angle) * p.speed)
+        return (hx + math.cos(p.angle) * p.speed,
+                hy + math.sin(p.angle) * p.speed)
 
     def _close_trail(self, p, new_head):
         p.in_base = True
         p.base_polygon = merge_trail_into_base(p.base_polygon, p.points)
+        p.territory_version += 1
 
         for victim in self.players:
             if victim is p or victim.is_dead or victim.base_polygon.is_empty:
@@ -244,6 +272,7 @@ class Game:
             new_attacker, new_victim = carve_out(p.base_polygon, victim.base_polygon)
             p.base_polygon = new_attacker
             victim.base_polygon = new_victim
+            victim.territory_version += 1
             if new_victim.is_empty:
                 victim.territory_points = []
             else:

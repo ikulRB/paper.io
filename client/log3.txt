@@ -1,15 +1,2 @@
 pygame 2.6.1 (SDL 2.28.4, Python 3.13.14)
 Hello from the pygame community. https://www.pygame.org/contribute.html
-[11:52:05][LOBBY] Starting join to game=123 at master=('84.237.55.42', 64782)
-[11:52:05][NET] Socket bound to ('0.0.0.0', 52698)
-[11:52:05][SESSION] join() called -> master_addr=('84.237.55.42', 64782), game=123, player=Player
-[11:52:05][NET] NAT punch requested for 84.237.55.42:64782
-[11:52:05][NET] SEND -> ('84.237.55.42', 64782) kind=join seq=1 ack=True bytes=24
-[11:52:06][NET] Switching peer ('84.237.55.42', 64782) to RELAY via ('159.200.243.235', 9193)
-[11:52:06][SESSION] First StateMsg received from ('84.237.55.42', 64782)! order=661, players=3
-[11:52:06][SESSION] Resolved my_id=3, master_id=1
-[11:52:06][LOBBY] on_state triggered during join!
-[11:52:06][LOBBY] Join succeeded! Transitioning to NetworkPlayState
-[11:52:06][PLAY] _init_session mode=join game=123
-[11:52:22][NET] SEND -> ('84.237.55.42', 64782) kind=leave seq=725 ack=False bytes=16
-[11:52:22][SESSION] stop() called

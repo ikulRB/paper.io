@@ -1,5 +1,6 @@
 import math
 import random
+from shapely.geometry import Point
 
 from game.geometry import make_territory_polygon, exterior_points
 
@@ -18,18 +19,23 @@ class Player:
         self.is_dead = False
         self.controller = controller
         self.player_id = 0
+        self.territory_version = 1
+        self._net_target_head = None
+        self._net_target_angle = None
+        self._is_turning_locally = False
 
         start_pos = self._spawn_position(map_radius)
+        sx, sy = start_pos
         self.last_head = start_pos
 
         self.points = [start_pos]
         self.base_trail_points = [start_pos]
 
-        self.territory_points = self._generate_start_territory(start_pos[0], start_pos[1])
+        self.territory_points = self._generate_start_territory(sx, sy)
         self.base_polygon = make_territory_polygon(self.territory_points)
         self.area_percentage = 0.0
 
-        self.angle = math.atan2(start_pos[1], start_pos[0]) + math.pi
+        self.angle = math.atan2(sy, sx) + math.pi
 
         self.set_color(color)
 
@@ -58,7 +64,8 @@ class Player:
 
     @staticmethod
     def _darken(color, k):
-        return (int(color[0] * k), int(color[1] * k), int(color[2] * k))
+        r, g, b = color
+        return (int(r * k), int(g * k), int(b * k))
 
     @staticmethod
     def _light_trail(color):
@@ -94,23 +101,56 @@ class Player:
         if pts:
             self.territory_points = pts
 
-    def update_from_network(self, head_x, head_y, angle, trail, territory, score=0, is_dead=False):
-        self.angle = angle
-        self.last_head = (head_x, head_y)
+    def predict_step(self, is_local_player=False):
+        if self.is_dead:
+            return
+
+        if self._net_target_angle is not None:
+            if not (is_local_player and self._is_turning_locally):
+                diff = (self._net_target_angle - self.angle + math.pi) % (2 * math.pi) - math.pi
+                self.angle += diff * (0.25 if is_local_player else 0.5)
+
+        hx, hy = self.last_head
+        nx = hx + math.cos(self.angle) * self.speed
+        ny = hy + math.sin(self.angle) * self.speed
+
+        if self._net_target_head is not None:
+            tx, ty = self._net_target_head
+            err = math.hypot(tx - nx, ty - ny)
+            if err > 80.0:
+                nx, ny = tx, ty
+            else:
+                blend = 0.25 if is_local_player else 0.45
+                nx += (tx - nx) * blend
+                ny += (ty - ny) * blend
+
+        if math.hypot(nx, ny) >= self.map_radius - 10:
+            return
+
+        self.last_head = (nx, ny)
+        if self.in_base:
+            self.base_trail_points = [(nx, ny)]
+        else:
+            self.points.append((nx, ny))
+
+    def apply_network_snapshot(self, head_x, head_y, angle, in_base, territory=None, score=0, is_dead=False):
         self.is_dead = is_dead
         self.area_percentage = score / 100.0
+        self._net_target_head = (head_x, head_y)
+        self._net_target_angle = angle
 
         if territory:
             self.territory_points = list(territory)
             self.base_polygon = make_territory_polygon(self.territory_points)
-        else:
-            self.territory_points = []
 
-        if trail and len(trail) > 1:
-            self.in_base = False
-            self.points = list(trail)
-            self.base_trail_points = [(head_x, head_y)]
-        else:
+        if in_base:
             self.in_base = True
             self.points = [(head_x, head_y)]
+            self.base_trail_points = [(head_x, head_y)]
+        else:
+            if self.in_base:
+                self.in_base = False
+                self.points = [(head_x, head_y)]
+            else:
+                self.points.append((head_x, head_y))
             self.base_trail_points = [(head_x, head_y)]

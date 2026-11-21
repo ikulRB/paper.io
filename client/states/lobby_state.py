@@ -5,7 +5,7 @@ from config import (
     WIDTH, HEIGHT, COLOR_BG, COLOR_TEXT, COLOR_PANEL,
     COLOR_BTN, COLOR_BTN_HOVER, COLOR_PLACEHOLDER,
     JOIN_TIMEOUT_S, MIN_PLAYERS_PER_GAME, MAX_PLAYERS_PER_GAME,
-    DEFAULT_PLAYERS_PER_GAME,
+    DEFAULT_PLAYERS_PER_GAME, AVAILABLE_COLORS,
 )
 from ui.widgets import (
     draw_rounded_button, draw_rounded_button_colored,
@@ -180,7 +180,6 @@ class LobbyState:
                 self.game_name_input += event.unicode
 
     def _make_master(self, name):
-        _llog(f"Creating master game={name}, max_players={self.max_players_selected}")
         return {
             "mode": "master",
             "game_name": name,
@@ -191,7 +190,6 @@ class LobbyState:
 
     def _cancel_joining(self):
         if self.joining is not None:
-            _llog("Cancelling active join attempt")
             try:
                 self.joining["session"].stop()
             except Exception:
@@ -200,24 +198,24 @@ class LobbyState:
 
     def _start_join(self, g):
         master = tuple(g["master"])
-        _llog(f"Starting join to game={g['name']} at master={master}")
         self.status_line = f"Подключение к {g['name']}…"
 
         state_received = {"state": None}
         error_msg = {"text": None}
 
         def on_state(state):
-            _llog("on_state triggered during join!")
             state_received["state"] = state
 
         def on_error(addr, err):
             msg_txt = err.message if err is not None else "disconnected"
-            _llog(f"on_error triggered during join: {msg_txt}")
             error_msg["text"] = msg_txt
+
+        color_idx = AVAILABLE_COLORS.index(self.color) if self.color in AVAILABLE_COLORS else 0
+        encoded_player_name = f"{self.player_name}#{color_idx}"
 
         session = GameSession(
             game_name=g["name"],
-            player_name=self.player_name,
+            player_name=encoded_player_name,
             status=pb.PLAYING,
             max_players=g.get("max_players", DEFAULT_PLAYERS_PER_GAME),
             on_state=on_state,
@@ -240,7 +238,6 @@ class LobbyState:
             return None
 
         if j["state_received"]["state"] is not None:
-            _llog("Join succeeded! Transitioning to NetworkPlayState")
             self.joining = None
             g = j["game"]
             return {
@@ -266,7 +263,6 @@ class LobbyState:
 
         elapsed = time.monotonic() - j["t0"]
         if elapsed >= JOIN_TIMEOUT_S:
-            _llog(f"Join timed out after {elapsed:.2f}s")
             self._cancel_joining()
             self.status_line = "Таймаут подключения"
             return None

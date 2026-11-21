@@ -9,6 +9,7 @@ from config import (
 )
 from ui.widgets import draw_rounded_button
 from net.session import GameSession
+from net.discovery import DiscoverySource
 from net.protocol import PROTOCOL_VERSION
 from game.game import Game
 from game.player import Player
@@ -17,10 +18,45 @@ try:
 except ImportError:
     import paper_pb2 as pb  # type: ignore
 
+FULL_SYNC_INTERVAL_S = 1.5
 
-def _plog(msg):
-    ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}][PLAY] {msg}", flush=True)
+
+def _parse_name_and_color(raw_name, fallback_idx=0):
+    if "#" in raw_name:
+        clean_name, idx_str = raw_name.rsplit("#", 1)
+        try:
+            idx = int(idx_str)
+            if 0 <= idx < len(AVAILABLE_COLORS):
+                return clean_name, idx
+        except ValueError:
+            pass
+    return raw_name, fallback_idx % len(AVAILABLE_COLORS)
+
+
+def _downsample_points(pts, min_dist=10.0, max_pts=64):
+    n = len(pts)
+    if n <= 4:
+        return pts
+    first_pt = next(iter(pts))
+    out = [first_pt]
+    last_x, last_y = first_pt
+    min_d2 = min_dist * min_dist
+    for pt in pts:
+        px, py = pt
+        dx = px - last_x
+        dy = py - last_y
+        if dx * dx + dy * dy >= min_d2:
+            out.append(pt)
+            last_x, last_y = px, py
+    last_pt = pts[-1]
+    if out[-1] != last_pt:
+        out.append(last_pt)
+    if len(out) > max_pts:
+        step = max(1, len(out) // max_pts)
+        out = out[::step]
+        if out[-1] != last_pt:
+            out.append(last_pt)
+    return out
 
 
 class NetworkPlayState:
@@ -41,7 +77,14 @@ class NetworkPlayState:
         self.disconnected = False
         self.game_started = False
         self._last_steer_dir = 0
+        self._last_steer_sent_t = 0.0
         self._end_anim_time = 0.0
+        self._sent_territory_versions = {}
+        self._last_full_sync_t = 0.0
+        self._player_color_indices = {}
+        self._fallback_discovery = None
+        self._last_rejoin_t = 0.0
+        self._migration_grace_until = 0.0
 
         self.panel_w, self.panel_h = 440, 420
         self.panel_x = WIDTH // 2 - self.panel_w // 2
@@ -53,11 +96,11 @@ class NetworkPlayState:
 
         while True:
             if self.disconnected:
-                _plog("Disconnected flag set, leaving NetworkPlayState")
                 self._leave()
                 return
 
             self.session.check_failover()
+            self._check_normal_migration()
             mx, my = pygame.mouse.get_pos()
 
             is_finished = self.game_started and (self.game.result in ("win", "lose"))
@@ -87,78 +130,122 @@ class NetworkPlayState:
             pygame.display.flip()
             self.clock.tick(60)
     def _init_session(self, info):
-        _plog(f"_init_session mode={info.get('mode')} game={info.get('game_name')}")
-        self.game = Game(self.screen, info["player_name"], info["color"], num_bots=0, is_network=True)
+        my_color = info.get("color")
+        my_color_idx = AVAILABLE_COLORS.index(my_color) if my_color in AVAILABLE_COLORS else 0
+        self.game = Game(self.screen, info.get("player_name"), my_color, num_bots=0, is_network=True)
         max_players = info.get("max_players", DEFAULT_PLAYERS_PER_GAME)
 
-        if "session" in info and info["session"] is not None:
-            self.session = info["session"]
+        if info.get("session") is not None:
+            self.session = info.get("session")
             self.session.max_players = max_players
             self.session.on_state = self._on_new_state
             self.session.on_steer = self._on_remote_steer
             self.session.on_player_join = self._on_remote_join
             self.session.on_player_leave = self._on_remote_leave
+            self.session.on_role_change = self._on_role_changed
             self.session.on_error = self._on_session_error
             if self.session.my_id:
                 self.my_id = self.session.my_id
         else:
             self.session = GameSession(
-                game_name=info["game_name"],
-                player_name=info["player_name"],
+                game_name=info.get("game_name"),
+                player_name=f"{info.get('player_name')}#{my_color_idx}",
                 status=info.get("status", pb.PLAYING),
                 max_players=max_players,
                 on_state=self._on_new_state,
                 on_steer=self._on_remote_steer,
                 on_player_join=self._on_remote_join,
                 on_player_leave=self._on_remote_leave,
+                on_role_change=self._on_role_changed,
                 on_error=self._on_session_error,
             )
 
-        if info["mode"] == "master":
+        if info.get("mode") == "master":
             self.session.role = pb.MASTER
             self.session.master_addr = self.session.net.endpoint()
             self.session.my_id = 1
             self.session.master_id = 1
             self.session.next_player_id = 2
-            self.session.player_names = {1: info["player_name"]}
+            self.session.player_names = {1: info.get("player_name")}
             self.session.player_status = {1: pb.PLAYING}
             self.session.player_roles = {1: pb.MASTER}
             self.my_id = 1
+            self._player_color_indices.update({1: my_color_idx})
 
             self.game.main_player.player_id = 1
 
             self.session.on_get_state = self._build_state_from_game
             self.session.state = self._build_state_from_game()
-            _plog(f"MASTER ready at {self.session.master_addr}, players_in_state={len(self.session.state.players)}")
             self.session._maybe_announce()
             self.session._start_ticker()
         else:
             if self.session.my_id:
-                self.game.main_player.player_id = self.session.my_id
-            if "state" in info and info["state"] is not None:
-                self._on_new_state(info["state"])
-            elif "session" not in info:
-                self.session.join(info["master_addr"])
+                self.my_id = self.session.my_id
+                self._player_color_indices.update({self.my_id: my_color_idx})
+                self.game.main_player.player_id = self.my_id
+            if info.get("state") is not None:
+                self._on_new_state(info.get("state"))
+            elif info.get("session") is None:
+                self.session.join(info.get("master_addr"))
+
+    def _on_role_changed(self, new_role):
+        if new_role == pb.MASTER:
+            # Даём 0.6 сек на переподключение игроков после смены хоста без ложных коллизий
+            self._migration_grace_until = time.monotonic() + 0.6
+            self.game.network_steer_dirs.clear()
+            self._sent_territory_versions.clear()
+            self._last_full_sync_t = 0.0
+            self.session.on_get_state = self._build_state_from_game
+            self.session.state = self._build_state_from_game()
+            self.session._maybe_announce()
+            self.session._start_ticker()
+            if self._fallback_discovery is not None:
+                self._fallback_discovery.close()
+                self._fallback_discovery = None
+
+    def _check_normal_migration(self):
+        if self.session is None or self.session.role != pb.NORMAL:
+            return
+        if self.session._master_lost_since == 0:
+            if self._fallback_discovery is not None:
+                self._fallback_discovery.close()
+                self._fallback_discovery = None
+            return
+
+        if self._fallback_discovery is None:
+            self._fallback_discovery = DiscoverySource()
+
+        now_t = time.monotonic()
+        if now_t - self._last_rejoin_t < 0.35:
+            return
+        self._last_rejoin_t = now_t
+
+        for g in self._fallback_discovery.poll():
+            if g.get("name") == self.session.game_name:
+                new_master = tuple(g.get("master"))
+                if new_master != self.session.master_addr:
+                    self.session.join(new_master)
+                    break
 
     def _on_session_error(self, addr, err):
-        _plog(f"_on_session_error from {addr}: {err}")
         self.disconnected = True
 
-    def _on_remote_join(self, pid, player_name, status):
-        _plog(f"_on_remote_join pid={pid} name={player_name}")
+    def _on_remote_join(self, pid, raw_player_name, status):
         for p in self.game.players:
             if p.player_id == pid:
                 return
-        color = AVAILABLE_COLORS[(pid - 1) % len(AVAILABLE_COLORS)]
-        new_p = Player(player_name, color, self.game.MAP_RADIUS)
+        clean_name, color_idx = _parse_name_and_color(raw_player_name, pid - 1)
+        self._player_color_indices.update({pid: color_idx})
+        self.session.player_names.update({pid: clean_name})
+        color = AVAILABLE_COLORS[color_idx]
+        new_p = Player(clean_name, color, self.game.MAP_RADIUS)
         new_p.player_id = pid
         self.game.players.append(new_p)
+        self._sent_territory_versions.clear()
         if len(self.game.players) >= self.session.max_players:
             self.game_started = True
-        _plog(f"Added player {player_name} (id={pid}), total players={len(self.game.players)}")
 
     def _on_remote_leave(self, pid):
-        _plog(f"_on_remote_leave pid={pid}")
         for p in self.game.players:
             if p.player_id == pid and not p.is_dead:
                 self.game._kill_player(p)
@@ -176,10 +263,17 @@ class NetworkPlayState:
         state.config.state_delay_ms = DEFAULT_STATE_DELAY_MS
         state.config.max_players = self.session.max_players
 
-        for p in self.game.players:
+        now_t = time.monotonic()
+        force_full_sync = (now_t - self._last_full_sync_t) >= FULL_SYNC_INTERVAL_S
+        if force_full_sync:
+            self._last_full_sync_t = now_t
+            self._sent_territory_versions.clear()
+
+        for p in list(self.game.players):
             ps = state.players.add()
             ps.player_id = p.player_id
-            ps.name = p.name
+            c_idx = self._player_color_indices.get(p.player_id, (p.player_id - 1) % len(AVAILABLE_COLORS))
+            ps.name = f"{p.name}#{c_idx}"
             ps.role = self.session.player_roles.get(p.player_id, pb.NORMAL)
             ps.status = pb.VIEWING if p.is_dead else self.session.player_status.get(p.player_id, pb.PLAYING)
             ps.score = int(p.area_percentage * 100)
@@ -188,10 +282,15 @@ class NetworkPlayState:
             ps.head.x = float(hx)
             ps.head.y = float(hy)
 
-            for px, py in p.territory_points:
-                ps.territory.add(x=float(px), y=float(py))
-            for px, py in p.points:
-                ps.trail.add(x=float(px), y=float(py))
+            if not p.in_base:
+                ps.trail.add(x=float(hx), y=float(hy))
+
+            ver = getattr(p, "territory_version", 1)
+            if self._sent_territory_versions.get(p.player_id) != ver:
+                self._sent_territory_versions.update({p.player_id: ver})
+                terr_pts = _downsample_points(p.territory_points, min_dist=10.0, max_pts=64)
+                for px, py in terr_pts:
+                    ps.territory.add(x=float(px), y=float(py))
 
         return state
 
@@ -204,20 +303,22 @@ class NetworkPlayState:
 
         net_players = []
         for ps in state.players:
+            clean_name, color_idx = _parse_name_and_color(ps.name, ps.player_id - 1)
+            self._player_color_indices.update({ps.player_id: color_idx})
             net_players.append({
                 "player_id": ps.player_id,
-                "name": ps.name,
+                "name": clean_name,
+                "color_idx": color_idx,
                 "angle": ps.angle,
                 "score": ps.score,
                 "is_dead": (ps.status == pb.VIEWING),
+                "in_base": (len(ps.trail) == 0),
                 "head": (ps.head.x, ps.head.y),
-                "trail": [(pt.x, pt.y) for pt in ps.trail],
                 "territory": [(pt.x, pt.y) for pt in ps.territory],
             })
         try:
             self.game.sync_players(net_players, my_id=self.my_id)
         except Exception:
-            _plog("Exception in self.game.sync_players:")
             traceback.print_exc()
     def _poll_steer_keys(self):
         if self.session is None or not self.game_started or self.game.main_player.is_dead:
@@ -229,8 +330,11 @@ class NetworkPlayState:
         if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
             steer += 1
 
-        if steer != self._last_steer_dir:
+        now_t = time.monotonic()
+        need_send = (steer != self._last_steer_dir) or (steer != 0 and (now_t - self._last_steer_sent_t) >= 0.08)
+        if need_send:
             self._last_steer_dir = steer
+            self._last_steer_sent_t = now_t
             if self.session.role == pb.MASTER:
                 self.game.apply_steer(self.my_id, steer)
             elif self.session.master_addr:
@@ -254,9 +358,10 @@ class NetworkPlayState:
             return
 
         if self.session.role == pb.MASTER:
-            self.game.update_network()
+            skip_collisions = (time.monotonic() < self._migration_grace_until)
+            self.game.update_network(skip_collisions=skip_collisions)
         else:
-            self.game.particles.update()
+            self.game.step_client_local(self._last_steer_dir)
 
     def _draw(self, mx, my, is_finished):
         s = self.screen
@@ -350,9 +455,14 @@ class NetworkPlayState:
         draw_rounded_button(self.screen, self.ok_btn, "OK", hover, self.fonts["ui"])
 
     def _leave(self):
+        if self._fallback_discovery is not None:
+            self._fallback_discovery.close()
+            self._fallback_discovery = None
         if self.session is not None:
             try:
-                if self.session.role != pb.MASTER and self.session.master_addr:
+                if self.session.role == pb.MASTER:
+                    self.session.resign_master()
+                elif self.session.master_addr:
                     seq = self.session.net.peer(self.session.master_addr).alloc_seq()
                     m = pb.GameMessage(
                         protocol_version=PROTOCOL_VERSION,

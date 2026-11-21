@@ -1,28 +1,2 @@
 pygame 2.6.1 (SDL 2.28.4, Python 3.13.14)
 Hello from the pygame community. https://www.pygame.org/contribute.html
-[11:50:57][LOBBY] Creating master game=123, max_players=3
-[11:50:57][PLAY] _init_session mode=master game=123
-[11:50:57][NET] Socket bound to ('0.0.0.0', 64782)
-[11:50:57][PLAY] MASTER ready at ('0.0.0.0', 64782), players_in_state=1
-[11:50:57][SESSION] Starting MASTER ticker thread
-[11:51:49][NET] Received PUNCH signal -> sending HOLE to ('84.237.55.42', 63808)
-[11:51:50][NET] RECV <- ('84.237.55.42', 63808) (relay=True) kind=join seq=1 sender=0
-[11:51:50][SESSION] _on_join from ('84.237.55.42', 63808): player=Player, game=123, my_role=0
-[11:51:50][SESSION] Assigned pid=2 to Player @ ('84.237.55.42', 63808)
-[11:51:50][PLAY] _on_remote_join pid=2 name=Player
-[11:51:50][PLAY] Added player Player (id=2), total players=2
-[11:51:50][NET] SEND -> ('84.237.55.42', 63808) kind=role_change seq=1 ack=True bytes=21
-[11:51:50][NET] RECV <- ('84.237.55.42', 63808) (relay=True) kind=join seq=1 sender=0
-[11:51:50][NET] RECV <- ('84.237.55.42', 63808) (relay=True) kind=join seq=1 sender=0
-[11:51:50][NET] RECV <- ('84.237.55.42', 63808) (relay=True) kind=join seq=1 sender=0
-[11:52:05][NET] Received PUNCH signal -> sending HOLE to ('84.237.55.42', 52698)
-[11:52:06][NET] RECV <- ('84.237.55.42', 52698) (relay=True) kind=join seq=1 sender=0
-[11:52:06][SESSION] _on_join from ('84.237.55.42', 52698): player=Player, game=123, my_role=0
-[11:52:06][SESSION] Assigned pid=3 to Player @ ('84.237.55.42', 52698)
-[11:52:06][PLAY] _on_remote_join pid=3 name=Player
-[11:52:06][PLAY] Added player Player (id=3), total players=3
-[11:52:06][NET] RECV <- ('84.237.55.42', 52698) (relay=True) kind=join seq=1 sender=0
-[11:52:06][NET] RECV <- ('84.237.55.42', 52698) (relay=True) kind=join seq=1 sender=0
-[11:52:22][NET] RECV <- ('84.237.55.42', 52698) (relay=True) kind=leave seq=725 sender=3
-[11:52:22][PLAY] _on_remote_leave pid=3
-[11:52:35][SESSION] stop() called

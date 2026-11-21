@@ -1,3 +1,4 @@
+import socket
 import threading
 import time
 import traceback
@@ -14,12 +15,22 @@ from net.protocol import PROTOCOL_VERSION, now_ms
 from config import CATALOG_ADDR, DEFAULT_PLAYERS_PER_GAME, DEFAULT_STATE_DELAY_MS
 
 ANNOUNCE_INTERVAL_MS = 1000
-PING_INTERVAL_MS = 500
+PING_INTERVAL_MS = 1000
 
 
-def _slog(msg):
-    ts = time.strftime("%H:%M:%S")
-    print(f"[{ts}][SESSION] {msg}", flush=True)
+def _get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip, _ = s.getsockname()
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def _base_name(raw_name):
+    return raw_name.rsplit("#", 1) if "#" in raw_name else raw_name
 
 
 class GameSession:
@@ -59,15 +70,15 @@ class GameSession:
 
         self.lock = threading.RLock()
         self.net = NetClient(on_message=self._on_message)
+        self.local_ip = _get_local_ip()
         self.running = True
         self.ticker_thread = None
         self._last_announce = 0
         self._last_ping = 0
+        self._master_lost_since = 0
 
     def join(self, master_addr):
-        _slog(f"join() called -> master_addr={master_addr}, game={self.game_name}, player={self.player_name}")
         self.master_addr = master_addr
-        self.net.punch_nat(master_addr)
         self._send_join(master_addr)
 
     def _send_join(self, addr):
@@ -81,8 +92,45 @@ class GameSession:
         msg.join.CopyFrom(j)
         self.net.send(addr, msg, require_ack=True)
 
+    def resign_master(self):
+        """Мягкая передача прав мастера заместителю перед выходом"""
+        with self.lock:
+            if self.role != pb.MASTER:
+                return
+            self._ensure_deputy()
+            if self.deputy_addr is not None and self.deputy_id != 0:
+                rc = pb.NodeRoleChangeMsg()
+                rc.sender_role = pb.NORMAL
+                rc.receiver_role = pb.MASTER
+                rc.state_order = self.state_order + 10
+                m = pb.GameMessage(
+                    protocol_version=PROTOCOL_VERSION,
+                    msg_seq=self.net.peer(self.deputy_addr).alloc_seq(),
+                    game_name=self.game_name,
+                    sender_id=self.my_id,
+                    receiver_id=self.deputy_id,
+                )
+                m.role_change.CopyFrom(rc)
+                self.net.send(self.deputy_addr, m, require_ack=False)
+
+                for pid, addr in list(self.other_addrs.items()):
+                    if pid in (self.my_id, self.deputy_id):
+                        continue
+                    rc_n = pb.NodeRoleChangeMsg()
+                    rc_n.sender_role = pb.NORMAL
+                    rc_n.receiver_role = pb.NORMAL
+                    rc_n.state_order = self.state_order + 10
+                    mn = pb.GameMessage(
+                        protocol_version=PROTOCOL_VERSION,
+                        msg_seq=self.net.peer(addr).alloc_seq(),
+                        game_name=self.game_name,
+                        sender_id=self.my_id,
+                        receiver_id=pid,
+                    )
+                    mn.role_change.CopyFrom(rc_n)
+                    self.net.send(addr, mn, require_ack=False)
+
     def stop(self):
-        _slog("stop() called")
         self.running = False
         self.net.stop()
 
@@ -102,7 +150,6 @@ class GameSession:
                            game_name=self.game_name)
         m.error.CopyFrom(e)
         return (m.SerializeToString(), m)
-
     def _on_message(self, addr, msg):
         kind = msg.WhichOneof("payload")
         if kind == "join":
@@ -120,7 +167,6 @@ class GameSession:
         if kind == "status_change":
             return self._on_status_change(addr, msg)
         if kind == "error":
-            _slog(f"Received ErrorMsg from {addr}: {msg.error.message}")
             if self.on_error is not None:
                 try:
                     self.on_error(addr, msg.error)
@@ -132,18 +178,25 @@ class GameSession:
     def _on_join(self, addr, msg):
         with self.lock:
             j = msg.join
-            _slog(f"_on_join from {addr}: player={j.player_name}, game={j.game_name}, my_role={self.role}")
             for pid, a in self.other_addrs.items():
                 if a == addr:
-                    _slog(f"_on_join duplicate from {addr}, returning ACK")
+                    self._broadcast_state()
                     return self._ack(addr, msg.msg_seq)
 
             if self.role != pb.MASTER:
-                _slog(f"_on_join ignored: I am not MASTER (role={self.role})")
                 return None
 
+            # Перепривязка существующего игрока после смены мастера
+            incoming_clean = _base_name(j.player_name)
+            for existing_pid, existing_name in list(self.player_names.items()):
+                if existing_pid != self.my_id and _base_name(existing_name) == incoming_clean:
+                    self.other_addrs[existing_pid] = addr
+                    self.player_roles[existing_pid] = pb.NORMAL
+                    self._ensure_deputy()
+                    self._broadcast_state()
+                    return self._ack(addr, msg.msg_seq)
+
             if len(self.player_names) >= self.max_players:
-                _slog(f"_on_join rejected: game full ({len(self.player_names)}/{self.max_players})")
                 return self._error(addr, msg.msg_seq, "game full")
 
             pid = self.next_player_id
@@ -152,20 +205,17 @@ class GameSession:
             self.player_status[pid] = j.requested_status
             self.other_addrs[pid] = addr
             self.player_roles[pid] = pb.NORMAL
-            _slog(f"Assigned pid={pid} to {j.player_name} @ {addr}")
 
             if self.on_player_join is not None:
                 try:
                     self.on_player_join(pid, j.player_name, j.requested_status)
                 except Exception:
-                    _slog("Exception in on_player_join:")
                     traceback.print_exc()
 
             if self.on_get_state is not None:
                 try:
                     self.state = self.on_get_state()
                 except Exception:
-                    _slog("Exception in on_get_state during _on_join:")
                     traceback.print_exc()
             elif self.state is not None:
                 ps = self.state.players.add()
@@ -183,21 +233,20 @@ class GameSession:
             return self._ack(addr, msg.msg_seq)
 
     def _on_steer(self, addr, msg):
-        with self.lock:
-            if self.role == pb.MASTER:
-                pid = msg.sender_id
-                if pid == 0:
-                    for p_id, a in self.other_addrs.items():
-                        if a == addr:
-                            pid = p_id
-                            break
-                ang = msg.steer.target_angle
-                if self.on_steer is not None and pid != 0:
-                    try:
-                        self.on_steer(pid, ang)
-                    except Exception:
-                        traceback.print_exc()
-            return self._ack(addr, msg.msg_seq)
+        if self.role == pb.MASTER:
+            pid = msg.sender_id
+            if pid == 0:
+                for p_id, a in self.other_addrs.items():
+                    if a == addr:
+                        pid = p_id
+                        break
+            ang = msg.steer.target_angle
+            if self.on_steer is not None and pid != 0:
+                try:
+                    self.on_steer(pid, ang)
+                except Exception:
+                    traceback.print_exc()
+        return None
 
     def _on_leave(self, addr, msg):
         with self.lock:
@@ -242,35 +291,39 @@ class GameSession:
     def _on_state(self, addr, msg):
         with self.lock:
             gs = msg.state.state
-            if gs.state_order <= self.state_order:
-                return self._ack(addr, msg.msg_seq)
-            if self.state_order == -1:
-                _slog(f"First StateMsg received from {addr}! order={gs.state_order}, players={len(gs.players)}")
+            is_new_master = (self.role != pb.MASTER) and (addr != self.master_addr or self._master_lost_since > 0)
+            if not is_new_master and gs.state_order <= self.state_order:
+                return None
+
+            if is_new_master:
+                self.master_addr = addr
+                self._master_lost_since = 0
+
             self.state = gs
             self.state_order = gs.state_order
+            if gs.next_player_id > self.next_player_id:
+                self.next_player_id = gs.next_player_id
             if self.state.config.max_players > 0:
                 self.max_players = self.state.config.max_players
-            if self.my_id == 0:
-                if msg.receiver_id != 0:
-                    self.my_id = msg.receiver_id
-                elif gs.next_player_id > 1:
-                    self.my_id = gs.next_player_id - 1
-                else:
-                    for p in reversed(list(self.state.players)):
-                        if p.name == self.player_name:
-                            self.my_id = p.player_id
-                            break
-                for p in self.state.players:
-                    if p.role == pb.MASTER:
-                        self.master_id = p.player_id
-                _slog(f"Resolved my_id={self.my_id}, master_id={self.master_id}")
+
+            my_clean = _base_name(self.player_name)
+            for p in self.state.players:
+                self.player_names[p.player_id] = p.name
+                self.player_roles[p.player_id] = p.role
+                self.player_status[p.player_id] = p.status
+                if self.my_id == 0 and _base_name(p.name) == my_clean:
+                    self.my_id = p.player_id
+                if p.role == pb.MASTER:
+                    self.master_id = p.player_id
+                elif p.role == pb.DEPUTY:
+                    self.deputy_id = p.player_id
+
             if self.on_state is not None:
                 try:
                     self.on_state(self.state)
                 except Exception:
-                    _slog("Exception in on_state callback:")
                     traceback.print_exc()
-            return self._ack(addr, msg.msg_seq)
+            return None
     def _on_role_change(self, addr, msg):
         rc = msg.role_change
         with self.lock:
@@ -283,6 +336,8 @@ class GameSession:
                 self.master_addr = addr
             if rc.sender_role == pb.NORMAL and msg.sender_id:
                 self._remove_player_id(msg.sender_id)
+                if self.role == pb.NORMAL and msg.sender_id == self.master_id:
+                    self._master_lost_since = now_ms()
             if self.on_role_change is not None:
                 try:
                     self.on_role_change(self.role)
@@ -318,12 +373,14 @@ class GameSession:
         self.role = pb.MASTER
         self.master_addr = self.net.endpoint()
         self.master_id = self.my_id
-        self.state_order = max(self.state_order, new_state_order - 1)
+        self.state_order = max(self.state_order, new_state_order) + 10
         self.player_roles[self.my_id] = pb.MASTER
         if old_master_id and old_master_id != self.my_id:
             self._remove_player_id(old_master_id)
         self.deputy_addr = None
         self.deputy_id = 0
+        self._master_lost_since = 0
+        self._last_announce = 0
         self._ensure_deputy()
         self._start_ticker()
         if self.on_role_change is not None:
@@ -335,7 +392,6 @@ class GameSession:
     def _start_ticker(self):
         if self.ticker_thread is not None and self.ticker_thread.is_alive():
             return
-        _slog("Starting MASTER ticker thread")
         self.ticker_thread = threading.Thread(target=self._ticker_loop, daemon=True)
         self.ticker_thread.start()
 
@@ -358,7 +414,6 @@ class GameSession:
                 if new_state is not None:
                     self.state = new_state
             except Exception:
-                _slog("Exception in on_get_state:")
                 traceback.print_exc()
         if self.state is None:
             return
@@ -373,16 +428,17 @@ class GameSession:
                                game_name=self.game_name,
                                sender_id=self.my_id, receiver_id=pid)
             m.state.CopyFrom(pb.StateMsg(state=self.state))
-            self.net.send(addr, m, require_ack=True)
+            self.net.send(addr, m, require_ack=False)
 
     def _maybe_announce(self):
         now = now_ms()
         if now - self._last_announce < ANNOUNCE_INTERVAL_MS:
             return
         self._last_announce = now
+        _, port = self.net.endpoint()
         ann = pb.AnnouncementMsg()
         g = ann.games.add()
-        g.game_name = self.game_name
+        g.game_name = f"{self.game_name}@{self.local_ip}:{port}"
         g.can_join = len(self.player_names) < self.max_players
         g.players_count = max(1, len(self.player_names))
         if self.state is not None:
@@ -422,24 +478,26 @@ class GameSession:
 
     def check_failover(self):
         dead = self.net.check_timeouts()
-        if not dead:
-            self._send_pings()
-            return
+        now = now_ms()
         with self.lock:
-            if self.role == pb.NORMAL and self.master_addr in dead:
-                if self.deputy_addr and self.deputy_addr not in dead:
-                    self.master_addr = self.deputy_addr
-                    self._send_join(self.master_addr)
-                else:
-                    if self.on_error is not None:
-                        try:
-                            self.on_error(None, None)
-                        except Exception:
-                            traceback.print_exc()
-            elif self.role == pb.MASTER:
+            if self.role == pb.DEPUTY and self.master_addr in dead:
+                self._take_master(self.master_addr, self.state_order + 10)
+                return
+
+            if self.role == pb.NORMAL and (self.master_addr in dead or self._master_lost_since > 0):
+                if self._master_lost_since == 0:
+                    self._master_lost_since = now
+                # Если заместитель не перехватил игру за 2 секунды (например, тоже вышел) — становимся мастером сами
+                if now - self._master_lost_since > 2000:
+                    self._take_master(self.master_addr, self.state_order + 10)
+                return
+
+            if self.role == pb.MASTER and dead:
                 for addr in dead:
                     self._remove_player(addr)
                 self._broadcast_state()
+
+        self._send_pings()
 
     def _send_pings(self):
         now = now_ms()

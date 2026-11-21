@@ -13,11 +13,23 @@ from net.protocol import PROTOCOL_VERSION, now_ms
 from config import CATALOG_ADDR, ANNOUNCE_TTL_MS, DEFAULT_PLAYERS_PER_GAME
 
 
+def _get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip, _ = s.getsockname()
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 class DiscoverySource:
     DISCOVER_PERIOD_S = 1.0
 
     def __init__(self, catalog_addr=CATALOG_ADDR):
         self.catalog_addr = catalog_addr
+        self.my_local_ip = _get_local_ip()
         self.entries = {}
         self.lock = threading.Lock()
         self.running = True
@@ -69,17 +81,37 @@ class DiscoverySource:
         with self.lock:
             for g in m.announcement.games:
                 raw_name = g.game_name
-                master_addr = addr
+                pub_addr = addr
                 if "|" in raw_name:
-                    clean_name, host_port = raw_name.rsplit("|", 1)
-                    if ":" in host_port:
-                        h, p = host_port.rsplit(":", 1)
+                    raw_name, pub_str = raw_name.rsplit("|", 1)
+                    if ":" in pub_str:
+                        h, p = pub_str.rsplit(":", 1)
                         try:
-                            master_addr = (h, int(p))
+                            pub_addr = (h, int(p))
+                        except ValueError:
+                            pass
+
+                lan_addr = None
+                if "@" in raw_name:
+                    clean_name, lan_str = raw_name.rsplit("@", 1)
+                    if ":" in lan_str:
+                        lh, lp = lan_str.rsplit(":", 1)
+                        try:
+                            lan_addr = (lh, int(lp))
                         except ValueError:
                             pass
                 else:
                     clean_name = raw_name
+
+                if lan_addr is not None:
+                    lan_ip, _ = lan_addr
+                    if lan_ip == self.my_local_ip:
+                        master_addr = lan_addr
+                    else:
+                        master_addr = pub_addr
+                else:
+                    master_addr = pub_addr
+
                 self.entries[(clean_name, master_addr)] = (clean_name, g, now)
 
     def poll(self):

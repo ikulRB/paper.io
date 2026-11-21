@@ -1,0 +1,90 @@
+syntax = "proto3";
+package paper;
+
+option go_package = "paper/pb;pb";
+
+enum NodeRole   { MASTER = 0; DEPUTY = 1; NORMAL = 2; }
+enum PlayerStatus { PLAYING = 0; VIEWING = 1; }
+
+message Vec2 { float x = 1; float y = 2; }
+
+message PlayerState {
+  int32 player_id = 1;
+  string name = 2;
+  NodeRole role = 3;
+  PlayerStatus status = 4;
+  int32 score = 5;
+  Vec2 head = 6;
+  float angle = 7;
+  repeated Vec2 trail = 8;
+  repeated Vec2 territory = 9;
+}
+
+message Food { Vec2 pos = 1; }
+
+message GameConfig {
+  float map_radius = 1;
+  int32 food_static = 2;
+  int32 state_delay_ms = 3;
+  int32 max_players = 4;
+}
+
+message GameState {
+  int32 state_order = 1;
+  int32 next_player_id = 2;
+  GameConfig config = 3;
+  repeated PlayerState players = 4;
+  repeated Food food = 5;
+}
+
+message JoinMsg {
+  string game_name = 1;
+  string player_name = 2;
+  PlayerStatus requested_status = 3;
+}
+message LeaveMsg {}
+message SteerMsg { float target_angle = 1; }
+message StateMsg { GameState state = 1; }
+message AckMsg   { int64 ack_seq = 1; }
+message ErrorMsg { int64 request_seq = 1; string message = 2; }
+message DiscoverMsg {}
+message PingMsg   { int64 sent_at_ms = 1; }
+
+message GameAnnouncement {
+  string game_name = 1;
+  GameConfig config = 2;
+  bool can_join = 3;
+  int32 players_count = 4;
+  string master_ip = 5;
+  int32 master_port = 6;
+}
+
+message AnnouncementMsg { repeated GameAnnouncement games = 1; }
+
+message NodeRoleChangeMsg {
+  NodeRole sender_role = 1;
+  NodeRole receiver_role = 2;
+  int32 state_order = 3;
+}
+message PlayerStatusChangeMsg { PlayerStatus requested_status = 1; }
+
+message GameMessage {
+  int32 protocol_version = 1;   // = 2
+  int64 msg_seq = 2;
+  string game_name = 3;
+  int32 sender_id = 4;
+  int32 receiver_id = 5;
+  oneof payload {
+    JoinMsg join = 10;
+    LeaveMsg leave = 11;
+    SteerMsg steer = 12;
+    StateMsg state = 13;
+    AckMsg ack = 14;
+    ErrorMsg error = 15;
+    DiscoverMsg discover = 16;
+    AnnouncementMsg announcement = 17;
+    PingMsg ping = 18;
+    NodeRoleChangeMsg role_change = 19;
+    PlayerStatusChangeMsg status_change = 20;
+  }
+}

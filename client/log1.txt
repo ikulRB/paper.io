@@ -1,0 +1,18 @@
+pygame 2.6.1 (SDL 2.28.4, Python 3.13.14)
+Hello from the pygame community. https://www.pygame.org/contribute.html
+[11:51:49][LOBBY] Starting join to game=123 at master=('84.237.55.42', 64782)
+[11:51:49][NET] Socket bound to ('0.0.0.0', 63808)
+[11:51:49][SESSION] join() called -> master_addr=('84.237.55.42', 64782), game=123, player=Player
+[11:51:49][NET] NAT punch requested for 84.237.55.42:64782
+[11:51:49][NET] SEND -> ('84.237.55.42', 64782) kind=join seq=1 ack=True bytes=24
+[11:51:50][NET] Switching peer ('84.237.55.42', 64782) to RELAY via ('159.200.243.235', 9193)
+[11:51:50][SESSION] First StateMsg received from ('84.237.55.42', 64782)! order=501, players=2
+[11:51:50][SESSION] Resolved my_id=2, master_id=1
+[11:51:50][LOBBY] on_state triggered during join!
+[11:51:50][NET] RECV <- ('84.237.55.42', 64782) (relay=True) kind=role_change seq=1 sender=1
+[11:51:50][LOBBY] Join succeeded! Transitioning to NetworkPlayState
+[11:51:50][PLAY] _init_session mode=join game=123
+[11:51:50][NET] RECV <- ('84.237.55.42', 64782) (relay=True) kind=role_change seq=1 sender=1
+[11:51:50][NET] RECV <- ('84.237.55.42', 64782) (relay=True) kind=role_change seq=1 sender=1
+[11:52:34][NET] SEND -> ('84.237.55.42', 64782) kind=leave seq=3992 ack=False bytes=16
+[11:52:34][SESSION] stop() called

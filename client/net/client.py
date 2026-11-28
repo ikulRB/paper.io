@@ -17,6 +17,7 @@ ACK_INTERVAL_MS = 150
 PEER_TIMEOUT_MS = 2500
 DEDUP_WINDOW = 512
 MAX_OUTSTANDING = 64
+NAT_KEEPALIVE_MS = 1000
 
 
 class Peer:
@@ -27,6 +28,7 @@ class Peer:
         self.dedup = {}
         self.max_in_seq = -1
         self.last_rx_ms = now_ms()
+        self.last_keepalive_ms = 0
 
     def alloc_seq(self):
         s = self.next_seq
@@ -68,6 +70,43 @@ class NetClient:
         self.t_recv.join(timeout=0.5)
         self.t_tick.join(timeout=0.5)
 
+    def punch(self, addr, count=5, interval=0.05):
+        """Best-effort UDP hole punching: шлёт ping на addr несколько раз,
+        чтобы создать/обновить NAT-маппинг в обе стороны.
+
+        Работает для full-cone и restricted-cone NAT. Для симметричного NAT
+        не поможет — там нужен TURN/релей. Все ошибки глотаются, игра
+        продолжает работать по старому пути.
+        """
+        if not self.running or addr is None:
+            return
+
+        def _worker():
+            for _ in range(count):
+                if not self.running:
+                    return
+                try:
+                    with self.lock:
+                        p = self.peer(addr)
+                        seq = p.alloc_seq()
+                        pm = pb.PingMsg()
+                        pm.sent_at_ms = now_ms()
+                        km = pb.GameMessage(
+                            protocol_version=PROTOCOL_VERSION,
+                            msg_seq=seq,
+                            sender_id=0,
+                        )
+                        km.ping.CopyFrom(pm)
+                        data = km.SerializeToString()
+                    self.sock.sendto(data, addr)
+                except OSError:
+                    pass
+                except Exception:
+                    pass
+                time.sleep(interval)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def send(self, addr, msg, require_ack=True, on_ack=None):
         if not self.running:
             return
@@ -87,6 +126,7 @@ class NetClient:
     def _requires_ack(self, msg):
         k = msg.WhichOneof("payload")
         return k not in ("announcement", "discover", "ack", "steer", "state", "ping")
+
     def _recv_loop(self):
         while self.running:
             try:
@@ -169,17 +209,40 @@ class NetClient:
             now = now_ms()
             with self.lock:
                 entries = []
+                keepalive_targets = []
                 for addr, p in self.peers.items():
+                    if addr == CATALOG_ADDR:
+                        continue
                     for seq, (data, last, cb) in list(p.pending.items()):
                         if now - last >= ACK_INTERVAL_MS:
                             entries.append((addr, seq, data))
                             p.pending[seq] = (data, now, cb)
+                    # UDP NAT keepalive: шлём пустой ping, чтобы NAT-таблица не истекала
+                    if now - p.last_keepalive_ms >= NAT_KEEPALIVE_MS:
+                        p.last_keepalive_ms = now
+                        keepalive_targets.append((addr, p))
             for addr, seq, data in entries:
                 if not self.running:
                     break
                 try:
                     self.sock.sendto(data, addr)
                 except OSError:
+                    pass
+            # Отправляем keepalive (ping) каждому peer, чтобы NAT держал маппинг
+            for addr, p in keepalive_targets:
+                if not self.running:
+                    break
+                try:
+                    pm = pb.PingMsg()
+                    pm.sent_at_ms = now
+                    km = pb.GameMessage(
+                        protocol_version=PROTOCOL_VERSION,
+                        msg_seq=p.alloc_seq(),
+                        sender_id=0,
+                    )
+                    km.ping.CopyFrom(pm)
+                    self.sock.sendto(km.SerializeToString(), addr)
+                except Exception:
                     pass
 
     def check_timeouts(self):

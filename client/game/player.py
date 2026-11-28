@@ -75,6 +75,7 @@ class Player:
             int(255 - (2 / 3) * (255 - g)),
             int(255 - (2 / 3) * (255 - b)),
         )
+
     def get_head(self):
         if self.is_dead:
             return self.last_head
@@ -139,9 +140,15 @@ class Player:
         self._net_target_head = (head_x, head_y)
         self._net_target_angle = angle
 
+        # FIX: обновляем полигон территории только если пришла НЕПУСТАЯ территория.
+        # Если territory is None — значит версия не изменилась, оставляем старую форму.
+        # Раньше при downsample'е и при повторных полных синках форма «прыгала».
         if territory:
             self.territory_points = list(territory)
-            self.base_polygon = make_territory_polygon(self.territory_points)
+            try:
+                self.base_polygon = make_territory_polygon(self.territory_points)
+            except Exception as e:
+                print(f"apply_network_snapshot: geometry error: {e}")
 
         if in_base:
             self.in_base = True

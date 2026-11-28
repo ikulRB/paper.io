@@ -54,6 +54,9 @@ class Game:
 
         if not is_network:
             self._spawn_bots(num_bots, bot_colors)
+        # В сетевом режиме main_player сохраняет валидную стартовую территорию
+        # из Player.__init__ — её разошлёт мастер (если это хост) или
+        # перезапишет первый StateMsg (если это клиент).
 
         self.final_territory_points = []
         self.final_player_color = player_color
@@ -80,6 +83,7 @@ class Game:
             name = BOT_NAMES[i % len(BOT_NAMES)]
             bot = Player(name, color, self.MAP_RADIUS, controller=BotController())
             self.players.append(bot)
+
     def update(self):
         self.particles.update()
 
@@ -207,6 +211,7 @@ class Game:
             self.result = "lose"
         elif len(self.players) > 1 and self._check_victory():
             self.result = "win"
+
     def _check_victory(self):
         if self.main_player.is_dead:
             return False

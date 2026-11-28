@@ -16,6 +16,8 @@ from config import CATALOG_ADDR, DEFAULT_PLAYERS_PER_GAME, DEFAULT_STATE_DELAY_M
 
 ANNOUNCE_INTERVAL_MS = 1000
 PING_INTERVAL_MS = 1000
+JOIN_RETRY_MS = 400
+JOIN_MAX_ATTEMPTS = 12
 
 
 def _get_local_ip():
@@ -30,7 +32,7 @@ def _get_local_ip():
 
 
 def _base_name(raw_name):
-    return raw_name.rsplit("#", 1) if "#" in raw_name else raw_name
+    return raw_name.rsplit("#", 1)[0] if "#" in raw_name else raw_name
 
 
 class GameSession:
@@ -77,20 +79,76 @@ class GameSession:
         self._last_ping = 0
         self._master_lost_since = 0
 
-    def join(self, master_addr):
-        self.master_addr = master_addr
-        self._send_join(master_addr)
+        # Параметры повторной отправки join (борьба с потерей UDP-пакетов и NAT)
+        self._join_target = None
+        self._join_pub = None
+        self._join_next_t = 0.0
+        self._join_attempts = 0
+        self._join_thread = None
+
+    # ---------- join с ретраями и hole punching ----------
+    def join(self, master_addr, master_pub=None):
+        with self.lock:
+            self.master_addr = master_addr
+            self._join_target = master_addr
+            self._join_pub = master_pub
+            self._join_next_t = time.monotonic()
+            self._join_attempts = 0
+        # Предварительный punch на публичный адрес мастера
+        if master_pub is not None and master_pub != master_addr:
+            self.net.punch(master_pub)
+        if self._join_thread is None or not self._join_thread.is_alive():
+            self._join_thread = threading.Thread(target=self._join_loop, daemon=True)
+            self._join_thread.start()
+
+    def _join_loop(self):
+        while self.running:
+            with self.lock:
+                target = self._join_target
+                now_t = time.monotonic()
+            if target is None:
+                return
+            if self.role == pb.MASTER:
+                return
+            if self.state is not None and self.my_id != 0:
+                return  # уже в игре
+            if now_t >= self._join_next_t:
+                with self.lock:
+                    self._join_attempts += 1
+                    attempts = self._join_attempts
+                    self._join_next_t = now_t + JOIN_RETRY_MS / 1000.0
+                if attempts > JOIN_MAX_ATTEMPTS:
+                    if self.on_error is not None:
+                        try:
+                            err = pb.ErrorMsg()
+                            err.request_seq = 0
+                            err.message = "join timeout"
+                            self.on_error(target, err)
+                        except Exception:
+                            traceback.print_exc()
+                    return
+                self._send_join(target)
+            time.sleep(0.05)
 
     def _send_join(self, addr):
-        seq = self.net.peer(addr).alloc_seq()
-        j = pb.JoinMsg()
-        j.game_name = self.game_name
-        j.player_name = self.player_name
-        j.requested_status = self.status
-        msg = pb.GameMessage(protocol_version=PROTOCOL_VERSION, msg_seq=seq,
-                             game_name=self.game_name)
-        msg.join.CopyFrom(j)
-        self.net.send(addr, msg, require_ack=True)
+        try:
+            # Повторный punch на публичный адрес на каждой попытке:
+            # NAT-маппинг мог истечь или смениться.
+            with self.lock:
+                pub = self._join_pub
+            if pub is not None and pub != addr:
+                self.net.punch(pub, count=3, interval=0.03)
+            seq = self.net.peer(addr).alloc_seq()
+            j = pb.JoinMsg()
+            j.game_name = self.game_name
+            j.player_name = self.player_name
+            j.requested_status = self.status
+            msg = pb.GameMessage(protocol_version=PROTOCOL_VERSION, msg_seq=seq,
+                                 game_name=self.game_name)
+            msg.join.CopyFrom(j)
+            self.net.send(addr, msg, require_ack=True)
+        except Exception:
+            traceback.print_exc()
 
     def resign_master(self):
         """Мягкая передача прав мастера заместителю перед выходом"""
@@ -132,6 +190,8 @@ class GameSession:
 
     def stop(self):
         self.running = False
+        with self.lock:
+            self._join_target = None
         self.net.stop()
 
     def _ack(self, addr, seq):
@@ -150,6 +210,7 @@ class GameSession:
                            game_name=self.game_name)
         m.error.CopyFrom(e)
         return (m.SerializeToString(), m)
+
     def _on_message(self, addr, msg):
         kind = msg.WhichOneof("payload")
         if kind == "join":
@@ -186,7 +247,7 @@ class GameSession:
             if self.role != pb.MASTER:
                 return None
 
-            # Перепривязка существующего игрока после смены мастера
+            # Перепривязка существующего игрока после смены мастера / смены NAT-порта
             incoming_clean = _base_name(j.player_name)
             for existing_pid, existing_name in list(self.player_names.items()):
                 if existing_pid != self.my_id and _base_name(existing_name) == incoming_clean:
@@ -273,7 +334,20 @@ class GameSession:
     def _on_ping(self, addr, msg):
         pm = msg.ping
         sender = msg.sender_id
+        # keepalive/punch от NetClient (sender_id=0):
+        # отвечаем, чтобы пробить NAT в обратную сторону, но не считаем игроком
         if sender == 0:
+            try:
+                reply = pb.GameMessage(
+                    protocol_version=PROTOCOL_VERSION,
+                    msg_seq=self.net.peer(addr).alloc_seq(),
+                    game_name=self.game_name,
+                    sender_id=self.my_id, receiver_id=0,
+                )
+                reply.ping.CopyFrom(pm)
+                self.net.send(addr, reply, require_ack=False)
+            except Exception:
+                traceback.print_exc()
             return None
         key = self.rtt_ping_sent.pop(sender, None)
         if key is not None:
@@ -298,6 +372,8 @@ class GameSession:
             if is_new_master:
                 self.master_addr = addr
                 self._master_lost_since = 0
+                # Успешный join — прекращаем ретраи
+                self._join_target = None
 
             self.state = gs
             self.state_order = gs.state_order
@@ -324,6 +400,7 @@ class GameSession:
                 except Exception:
                     traceback.print_exc()
             return None
+
     def _on_role_change(self, addr, msg):
         rc = msg.role_change
         with self.lock:
@@ -487,7 +564,7 @@ class GameSession:
             if self.role == pb.NORMAL and (self.master_addr in dead or self._master_lost_since > 0):
                 if self._master_lost_since == 0:
                     self._master_lost_since = now
-                # Если заместитель не перехватил игру за 2 секунды (например, тоже вышел) — становимся мастером сами
+                # Если заместитель не перехватил игру за 2 секунды — становимся мастером сами
                 if now - self._master_lost_since > 2000:
                     self._take_master(self.master_addr, self.state_order + 10)
                 return

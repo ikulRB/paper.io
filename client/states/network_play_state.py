@@ -6,8 +6,10 @@ import pygame
 from config import (
     WIDTH, HEIGHT, COLOR_TEXT, COLOR_BG, COLOR_PANEL,
     AVAILABLE_COLORS, DEFAULT_STATE_DELAY_MS, DEFAULT_PLAYERS_PER_GAME,
+    MIN_PLAYERS_PER_GAME,
 )
 from ui.widgets import draw_rounded_button
+from ui.end_screen import EndScreen
 from net.session import GameSession
 from net.discovery import DiscoverySource
 from net.protocol import PROTOCOL_VERSION
@@ -18,7 +20,14 @@ try:
 except ImportError:
     import paper_pb2 as pb  # type: ignore
 
-FULL_SYNC_INTERVAL_S = 1.5
+# FIX: полный синк территории реже (3 сек вместо 1.5) — меньше «прыжков» формы
+FULL_SYNC_INTERVAL_S = 3.0
+
+# FIX: автостарт лобби. Игра начнётся либо при заполнении max_players,
+# либо через LOBBY_TIMEOUT_S секунд после первого не-мастер join'а,
+# при условии, что в лобби есть хотя бы LOBBY_MIN_PLAYERS игроков.
+LOBBY_TIMEOUT_S = 8.0
+LOBBY_MIN_PLAYERS = 2
 
 
 def _parse_name_and_color(raw_name, fallback_idx=0):
@@ -33,40 +42,7 @@ def _parse_name_and_color(raw_name, fallback_idx=0):
     return raw_name, fallback_idx % len(AVAILABLE_COLORS)
 
 
-def _downsample_points(pts, min_dist=10.0, max_pts=64):
-    n = len(pts)
-    if n <= 4:
-        return pts
-    first_pt = next(iter(pts))
-    out = [first_pt]
-    last_x, last_y = first_pt
-    min_d2 = min_dist * min_dist
-    for pt in pts:
-        px, py = pt
-        dx = px - last_x
-        dy = py - last_y
-        if dx * dx + dy * dy >= min_d2:
-            out.append(pt)
-            last_x, last_y = px, py
-    last_pt = pts[-1]
-    if out[-1] != last_pt:
-        out.append(last_pt)
-    if len(out) > max_pts:
-        step = max(1, len(out) // max_pts)
-        out = out[::step]
-        if out[-1] != last_pt:
-            out.append(last_pt)
-    return out
-
-
 class NetworkPlayState:
-    DEATH_RED_DELAY = 900
-    DEATH_PANEL_DELAY = 1000
-    DEATH_OK_DELAY = 1500
-
-    WIN_COLOR = (40, 160, 60)
-    LOSE_COLOR = (200, 30, 30)
-
     def __init__(self, screen, clock, fonts):
         self.screen = screen
         self.clock = clock
@@ -86,9 +62,12 @@ class NetworkPlayState:
         self._last_rejoin_t = 0.0
         self._migration_grace_until = 0.0
 
-        self.panel_w, self.panel_h = 440, 420
-        self.panel_x = WIDTH // 2 - self.panel_w // 2
-        self.ok_btn = pygame.Rect(WIDTH // 2 - 60, 0, 120, 40)
+        # FIX: таймер автостарта лобби
+        self._lobby_first_join_t = 0.0
+
+        # Общий экран окончания игры
+        self.end_screen = EndScreen(screen, fonts)
+
         self.btn_leave = pygame.Rect(WIDTH - 260, HEIGHT - 70, 240, 50)
 
     def run(self, session_info):
@@ -103,19 +82,16 @@ class NetworkPlayState:
             self._check_normal_migration()
             mx, my = pygame.mouse.get_pos()
 
-            is_finished = self.game_started and (self.game.result in ("win", "lose"))
-
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self._leave()
                     return
-                if (is_finished and event.type == pygame.MOUSEBUTTONDOWN
-                        and event.button == 1
-                        and self._end_anim_time > self.DEATH_OK_DELAY):
-                    if self.ok_btn.collidepoint(event.pos):
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    is_finished = self.game_started and (self.game.result in ("win", "lose"))
+                    if (is_finished
+                            and self.end_screen.ok_clicked(event.pos, self._end_anim_time)):
                         self._leave()
                         return
-                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     if self.btn_leave.collidepoint(event.pos):
                         self._leave()
                         return
@@ -123,12 +99,14 @@ class NetworkPlayState:
             self._poll_steer_keys()
             self._update_logic()
 
+            is_finished = self.game_started and (self.game.result in ("win", "lose"))
             if is_finished:
                 self._end_anim_time += 16.67
 
             self._draw(mx, my, is_finished)
             pygame.display.flip()
             self.clock.tick(60)
+
     def _init_session(self, info):
         my_color = info.get("color")
         my_color_idx = AVAILABLE_COLORS.index(my_color) if my_color in AVAILABLE_COLORS else 0
@@ -176,6 +154,11 @@ class NetworkPlayState:
 
             self.session.on_get_state = self._build_state_from_game
             self.session.state = self._build_state_from_game()
+            # FIX: сбрасываем «прогретые» версии территорий, иначе первый
+            # broadcast после старта пойдёт без territory и клиенты увидят
+            # игроков «без территорий» до FULL_SYNC_INTERVAL_S.
+            self._sent_territory_versions.clear()
+            self._last_full_sync_t = 0.0
             self.session._maybe_announce()
             self.session._start_ticker()
         else:
@@ -186,11 +169,11 @@ class NetworkPlayState:
             if info.get("state") is not None:
                 self._on_new_state(info.get("state"))
             elif info.get("session") is None:
-                self.session.join(info.get("master_addr"))
+                master_pub = info.get("master_pub")
+                self.session.join(info.get("master_addr"), master_pub=master_pub)
 
     def _on_role_changed(self, new_role):
         if new_role == pb.MASTER:
-            # Даём 0.6 сек на переподключение игроков после смены хоста без ложных коллизий
             self._migration_grace_until = time.monotonic() + 0.6
             self.game.network_steer_dirs.clear()
             self._sent_territory_versions.clear()
@@ -223,8 +206,9 @@ class NetworkPlayState:
         for g in self._fallback_discovery.poll():
             if g.get("name") == self.session.game_name:
                 new_master = tuple(g.get("master"))
+                new_pub = tuple(g.get("master_pub")) if g.get("master_pub") else new_master
                 if new_master != self.session.master_addr:
-                    self.session.join(new_master)
+                    self.session.join(new_master, master_pub=new_pub)
                     break
 
     def _on_session_error(self, addr, err):
@@ -241,9 +225,12 @@ class NetworkPlayState:
         new_p = Player(clean_name, color, self.game.MAP_RADIUS)
         new_p.player_id = pid
         self.game.players.append(new_p)
+        # Новый игрок должен получить полную территорию всех на ближайшем тике
         self._sent_territory_versions.clear()
-        if len(self.game.players) >= self.session.max_players:
-            self.game_started = True
+
+        # FIX: запускаем таймер автостарта при первом не-мастер игроке
+        if self._lobby_first_join_t == 0.0 and not self.game_started:
+            self._lobby_first_join_t = time.monotonic()
 
     def _on_remote_leave(self, pid):
         for p in self.game.players:
@@ -288,8 +275,10 @@ class NetworkPlayState:
             ver = getattr(p, "territory_version", 1)
             if self._sent_territory_versions.get(p.player_id) != ver:
                 self._sent_territory_versions.update({p.player_id: ver})
-                terr_pts = _downsample_points(p.territory_points, min_dist=10.0, max_pts=64)
-                for px, py in terr_pts:
+                # FIX: без downsample — шлём точную форму территории.
+                # Иначе при повторной отправке точки «перескакивали»,
+                # и у клиентов форма территории мерцала/ломалась.
+                for px, py in p.territory_points:
                     ps.territory.add(x=float(px), y=float(py))
 
         return state
@@ -298,8 +287,13 @@ class NetworkPlayState:
         if self.my_id == 0 and self.session.my_id:
             self.my_id = self.session.my_id
 
-        if len(state.players) >= self.session.max_players:
-            self.game_started = True
+        # FIX: на клиентах on_player_join не вызывается (join обрабатывает мастер),
+        # поэтому таймер автостарта взводим здесь, как только в state
+        # появляется первый не-мастер игрок.
+        if not self.game_started and self._lobby_first_join_t == 0.0:
+            non_master = [ps for ps in state.players if ps.role != pb.MASTER]
+            if non_master:
+                self._lobby_first_join_t = time.monotonic()
 
         net_players = []
         for ps in state.players:
@@ -320,6 +314,7 @@ class NetworkPlayState:
             self.game.sync_players(net_players, my_id=self.my_id)
         except Exception:
             traceback.print_exc()
+
     def _poll_steer_keys(self):
         if self.session is None or not self.game_started or self.game.main_player.is_dead:
             return
@@ -352,10 +347,28 @@ class NetworkPlayState:
                 self.session.net.send(self.session.master_addr, m, require_ack=False)
 
     def _update_logic(self):
+        # FIX: старт лобби — либо полный состав, либо таймаут после первого join'а.
+        # Раньше требовалось ровно len(players) >= max_players, из-за чего
+        # при недоборе игра «висела» в ожидании.
         if not self.game_started:
-            if len(self.game.players) >= self.session.max_players:
+            players_now = len(self.game.players)
+            started = False
+            if players_now >= self.session.max_players:
+                started = True
+            elif (players_now >= LOBBY_MIN_PLAYERS
+                  and self._lobby_first_join_t > 0.0
+                  and time.monotonic() - self._lobby_first_join_t >= LOBBY_TIMEOUT_S):
+                started = True
+            if started:
                 self.game_started = True
-            return
+                self._lobby_first_join_t = 0.0
+                # FIX: принудительный полный синк территорий на первом же
+                # тике после старта. Иначе клиенты получат state без territory
+                # и увидят «пустые» базы до FULL_SYNC_INTERVAL_S.
+                self._sent_territory_versions.clear()
+                self._last_full_sync_t = 0.0
+            else:
+                return
 
         if self.session.role == pb.MASTER:
             skip_collisions = (time.monotonic() < self._migration_grace_until)
@@ -369,100 +382,30 @@ class NetworkPlayState:
         if not self.game_started:
             s.fill(COLOR_BG)
             wait_text = self.fonts["title"].render("ОЖИДАНИЕ ИГРОКОВ...", True, COLOR_TEXT)
-            s.blit(wait_text, (WIDTH // 2 - wait_text.get_width() // 2, HEIGHT // 2 - 50))
-            sub_text = self.fonts["ui"].render(
-                f"Подключено: {len(self.game.players)}/{self.session.max_players}",
-                True, COLOR_TEXT
-            )
-            s.blit(sub_text, (WIDTH // 2 - sub_text.get_width() // 2, HEIGHT // 2 + 10))
-        else:
-            self.game.draw()
+            s.blit(wait_text, (WIDTH // 2 - wait_text.get_width() // 2, HEIGHT // 2 - 60))
 
-            role_name = {
-                pb.MASTER: "MASTER",
-                pb.DEPUTY: "DEPUTY",
-                pb.NORMAL: "NORMAL",
-            }.get(self.session.role, "?")
-            role_surf = self.fonts["ui"].render(f"Сеть: {role_name} (ID {self.my_id})", True, (0, 0, 0))
-            s.blit(role_surf, (20, HEIGHT - 35))
+            need = self.session.max_players
+            cnt = len(self.game.players)
+            info = self.fonts["ui"].render(f"{cnt} / {need}", True, COLOR_TEXT)
+            s.blit(info, (WIDTH // 2 - info.get_width() // 2, HEIGHT // 2))
 
-            if is_finished:
-                self._draw_end_overlay(mx, my)
+            draw_rounded_button(s, self.btn_leave, "Выйти",
+                                self.btn_leave.collidepoint(mx, my), self.fonts["ui"])
+            return
 
-        draw_rounded_button(s, self.btn_leave, "Выйти", self.btn_leave.collidepoint(mx, my), self.fonts["ui"])
+        self.game.draw()
 
-    def _draw_end_overlay(self, mx, my):
-        win = (self.game.result == "win")
-        overlay_color = (30, 120, 40) if win else (160, 20, 20)
+        if is_finished:
+            self.end_screen.draw(self.game, self._end_anim_time, mx, my)
 
-        if self._end_anim_time > self.DEATH_RED_DELAY:
-            alpha = min(110, int((self._end_anim_time - self.DEATH_RED_DELAY) * 0.18))
-            surf = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-            surf.fill((*overlay_color, alpha))
-            self.screen.blit(surf, (0, 0))
-
-        if self._end_anim_time >= self.DEATH_PANEL_DELAY:
-            panel_y = self._compute_panel_y()
-            self._draw_panel(panel_y, win)
-            if self._end_anim_time > self.DEATH_OK_DELAY:
-                self._draw_ok_button(panel_y, mx, my)
-
-    def _compute_panel_y(self):
-        progress = min(1.0, (self._end_anim_time - self.DEATH_PANEL_DELAY) / 500.0)
-        elastic_offset = math.sin(progress * math.pi) * 30 * (1.0 - progress)
-        return int(-self.panel_h + (HEIGHT // 2 - self.panel_h // 2 + self.panel_h) * progress - elastic_offset)
-
-    def _draw_panel(self, panel_y, win):
-        s = self.screen
-        pygame.draw.rect(s, COLOR_PANEL, (self.panel_x, panel_y, self.panel_w, self.panel_h), border_radius=14)
-        pygame.draw.rect(s, (0, 0, 0), (self.panel_x, panel_y, self.panel_w, self.panel_h), width=3, border_radius=14)
-
-        title_text = "ПОБЕДА!" if win else "ПОРАЖЕНИЕ"
-        title_color = self.WIN_COLOR if win else self.LOSE_COLOR
-        go = self.game.font_gameover.render(title_text, True, title_color)
-        s.blit(go, (WIDTH // 2 - go.get_width() // 2, panel_y + 20))
-
-        score = self.game.font_name.render(
-            f"Ваша доля: {self.game.main_player.area_percentage:.2f} %", True, COLOR_TEXT
-        )
-        s.blit(score, (WIDTH // 2 - score.get_width() // 2, panel_y + 75))
-
-        self._draw_end_minimap(panel_y)
-
-    def _draw_end_minimap(self, panel_y):
-        s = self.screen
-        radius = 110
-        m_cx, m_cy = WIDTH // 2, panel_y + 220
-        scale = radius / self.game.MAP_RADIUS
-
-        pygame.draw.circle(s, (230, 230, 230), (m_cx, m_cy), radius)
-
-        for p in self.game.players:
-            if p.is_dead or len(p.territory_points) <= 2:
-                continue
-            mini = [(int(x * scale + m_cx), int(y * scale + m_cy)) for x, y in p.territory_points]
-            pygame.draw.polygon(s, p.territory_color, mini)
-
-        if self.game.main_player.is_dead and len(self.game.final_territory_points) > 2:
-            mini = [(int(x * scale + m_cx), int(y * scale + m_cy)) for x, y in self.game.final_territory_points]
-            pygame.draw.polygon(s, self.game.final_territory_color, mini)
-
-        pygame.draw.circle(s, (40, 40, 40), (m_cx, m_cy), radius, 2)
-
-    def _draw_ok_button(self, panel_y, mx, my):
-        self.ok_btn.y = panel_y + 355
-        hover = self.ok_btn.collidepoint(mx, my)
-        draw_rounded_button(self.screen, self.ok_btn, "OK", hover, self.fonts["ui"])
+        draw_rounded_button(s, self.btn_leave, "Выйти",
+                            self.btn_leave.collidepoint(mx, my), self.fonts["ui"])
 
     def _leave(self):
-        if self._fallback_discovery is not None:
-            self._fallback_discovery.close()
-            self._fallback_discovery = None
-        if self.session is not None:
-            try:
-                if self.session.role == pb.MASTER:
-                    self.session.resign_master()
-                elif self.session.master_addr:
+        try:
+            if self.session is not None:
+                self.session.resign_master()
+                if self.session.role != pb.MASTER and self.session.master_addr:
                     seq = self.session.net.peer(self.session.master_addr).alloc_seq()
                     m = pb.GameMessage(
                         protocol_version=PROTOCOL_VERSION,
@@ -473,7 +416,13 @@ class NetworkPlayState:
                     )
                     m.leave.CopyFrom(pb.LeaveMsg())
                     self.session.net.send(self.session.master_addr, m, require_ack=False)
-            except Exception:
-                pass
-            self.session.stop()
-            self.session = None
+                self.session.stop()
+        except Exception:
+            traceback.print_exc()
+        finally:
+            if self._fallback_discovery is not None:
+                try:
+                    self._fallback_discovery.close()
+                except Exception:
+                    pass
+                self._fallback_discovery = None

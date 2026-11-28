@@ -163,6 +163,7 @@ class LobbyState:
             if idx is not None:
                 self.selected_idx = idx
         return None
+
     def _handle_create_key(self, event):
         if event.key == pygame.K_RETURN:
             name = self.game_name_input.strip()
@@ -198,6 +199,7 @@ class LobbyState:
 
     def _start_join(self, g):
         master = tuple(g["master"])
+        master_pub = tuple(g["master_pub"]) if g.get("master_pub") else master
         self.status_line = f"Подключение к {g['name']}…"
 
         state_received = {"state": None}
@@ -221,11 +223,12 @@ class LobbyState:
             on_state=on_state,
             on_error=on_error,
         )
-        session.join(master)
+        session.join(master, master_pub=master_pub)
 
         self.joining = {
             "game": g,
             "master": master,
+            "master_pub": master_pub,
             "session": session,
             "state_received": state_received,
             "error_msg": error_msg,
@@ -246,6 +249,7 @@ class LobbyState:
                 "player_name": self.player_name,
                 "color": self.color,
                 "master_addr": j["master"],
+                "master_pub": j.get("master_pub", j["master"]),
                 "status": pb.PLAYING,
                 "max_players": g.get("max_players", DEFAULT_PLAYERS_PER_GAME),
                 "state": j["state_received"]["state"],
